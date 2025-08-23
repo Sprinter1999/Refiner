@@ -25,9 +25,11 @@ def train_net_fedrefiner(net_id, net, global_model, train_dataloader, test_datal
             optimizer.zero_grad()
             target = target.long()
             
-            _, _, out = net(x)
+            _, feat, out = net(x)
             if out.dim() == 1:
                 out = out.unsqueeze(0)
+            if feat.dim() == 1:
+                feat = feat.unsqueeze(0)
             
             if is_warmup:
                 # 第一阶段：使用SCE进行预热
@@ -35,7 +37,7 @@ def train_net_fedrefiner(net_id, net, global_model, train_dataloader, test_datal
                 loss = sce_criterion(out, target)
             else:
                 # 第二阶段：GMM识别噪声样本 + 标签修正 + 对比损失
-                loss = train_net_fedrefiner_stage2(net, x, target, out, args, num_classes)
+                loss = train_net_fedrefiner_stage2(net, x, target, out, feat, args, num_classes)
             
             loss.backward()
             optimizer.step()
@@ -48,7 +50,7 @@ def train_net_fedrefiner(net_id, net, global_model, train_dataloader, test_datal
     return None
 
 
-def train_net_fedrefiner_stage2(net, x, target, out, args, num_classes):
+def train_net_fedrefiner_stage2(net, x, target, out, feat, args, num_classes):
     """FedRefiner第二阶段训练逻辑"""
     # 计算交叉熵损失用于GMM
     ce_loss_fn = torch.nn.CrossEntropyLoss(reduction='none')
@@ -85,7 +87,7 @@ def train_net_fedrefiner_stage2(net, x, target, out, args, num_classes):
     sce_loss = sce_criterion(out, corrected_targets)
     
     # 计算对比损失（基于TriTAN中的loss_2）
-    contrastive_loss = compute_contrastive_loss(net, x, corrected_targets, args)
+    contrastive_loss = compute_contrastive_loss(feat, corrected_targets, args)
     
     # 总损失
     contrastive_weight = getattr(args, 'contrastive_weight', 0.1)
@@ -94,12 +96,14 @@ def train_net_fedrefiner_stage2(net, x, target, out, args, num_classes):
     return total_loss
 
 
-def compute_contrastive_loss(net, x, targets, args):
+def compute_contrastive_loss(feats, targets, args):
     """计算对比损失，基于TriTAN中的loss_2"""
-    # 获取特征表示
-    _, feats = net(x)
+    # 确保特征维度正确
     if feats.dim() == 1:
         feats = feats.unsqueeze(0)
+    
+    # 归一化特征
+    feats = F.normalize(feats, p=2, dim=1)
     
     # 计算特征相似度矩阵
     sim_mat = torch.matmul(feats, feats.t())
@@ -121,7 +125,7 @@ def compute_contrastive_loss(net, x, targets, args):
         neg_loss = torch.sum(neg_pair)
         contrastive_loss = (pos_loss + neg_loss) / targets.shape[0]
     else:
-        contrastive_loss = torch.tensor(0.0, device=x.device, requires_grad=True)
+        contrastive_loss = torch.tensor(0.0, device=feats.device, requires_grad=True)
     
     return contrastive_loss
 
@@ -232,12 +236,14 @@ def fedrefiner_alg(args, n_comm_rounds, nets, global_model, party_list_rounds, n
                     optimizer.zero_grad()
                     target = target.long()
                     
-                    _, _, out = net(x)
+                    _, feat, out = net(x)
                     if out.dim() == 1:
                         out = out.unsqueeze(0)
+                    if feat.dim() == 1:
+                        feat = feat.unsqueeze(0)
                     
                     # 第二阶段：GMM识别噪声样本 + 标签修正 + 对比损失
-                    loss = train_net_fedrefiner_stage2(net, x, target, out, args, num_classes)
+                    loss = train_net_fedrefiner_stage2(net, x, target, out, feat, args, num_classes)
                     
                     loss.backward()
                     optimizer.step()
