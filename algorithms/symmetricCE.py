@@ -18,8 +18,10 @@ class SCELoss(torch.nn.Module):
         # RCE
         pred_softmax = F.softmax(pred, dim=1)
         pred_softmax = torch.clamp(pred_softmax, min=1e-7, max=1.0)
+        # 使用输入张量的设备，而不是硬编码的设备
+        device = pred.device
         label_one_hot = torch.nn.functional.one_hot(
-            labels, self.num_classes).float().to(self.device)
+            labels, self.num_classes).float().to(device)
         label_one_hot = torch.clamp(label_one_hot, min=1e-4, max=1.0)
         rce = (-1*torch.sum(pred_softmax * torch.log(label_one_hot), dim=1))  # shape: [batch]
 

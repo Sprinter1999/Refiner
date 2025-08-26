@@ -92,9 +92,10 @@ def get_args():
     parser.add_argument('--center_sep_weight', type=float, default=0.05, help='weight for center separation loss in fedrot')
     
     #for FedRefiner
-    parser.add_argument('--tao', type=float, default=0.8, help='confidence threshold for label correction in FedRefiner')
+    parser.add_argument('--tao', type=float, default=0.85, help='confidence threshold for label correction in FedRefiner')
     parser.add_argument('--fedrefiner_warmup', type=int, default=20, help='warmup rounds for FedRefiner')
     parser.add_argument('--contrastive_weight', type=float, default=0.1, help='weight for contrastive loss in FedRefiner')
+
     
     # Visualization
     parser.add_argument('--tsne', action='store_true', help='generate t-SNE visualization after training')

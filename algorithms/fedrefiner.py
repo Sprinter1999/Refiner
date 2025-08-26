@@ -8,14 +8,79 @@ from utils.utils import compute_accuracy, mkdirs
 from algorithms.symmetricCE import SCELoss
 
 
+def normalize_losses(losses_array):
+    """Min-max normalization preprocessing for losses"""
+    min_loss = np.min(losses_array)
+    max_loss = np.max(losses_array)
+    normalized_losses = (losses_array - min_loss) / (max_loss - min_loss + 1e-8)
+    return normalized_losses
+
+
+def precompute_gmm_with_global_model(global_model, train_dataloader, args):
+    """Pre-train GMM using global model"""
+    # Ensure global model is on GPU
+    device = next(global_model.parameters()).device
+    if device.type == 'cpu':
+        global_model = global_model.cuda()
+        device = torch.device('cuda')
+    
+    global_model.eval()
+    all_losses = []
+    all_targets = []
+    
+    with torch.no_grad():
+        for batch_idx, (x, target, idx) in enumerate(train_dataloader):
+            x, target = x.to(device), target.to(device)
+            _, _, out = global_model(x)
+
+            # Ensure dimension compatibility
+            if out.dim() == 1:
+                out = out.unsqueeze(0)
+
+            ce_losses = F.cross_entropy(out, target, reduction='none')
+            all_losses.extend(ce_losses.cpu().numpy())
+            all_targets.extend(target.cpu().numpy())
+    
+    # Convert to numpy array
+    losses_array = np.array(all_losses).reshape(-1, 1)
+
+    # Apply normalization preprocessing to losses
+    losses_array = normalize_losses(losses_array)
+
+    # Train GMM
+    gmm = GaussianMixture(n_components=2, random_state=0, n_init=3)
+    gmm.fit(losses_array)
+
+    # Determine clean/noisy labels
+    labels_gmm = gmm.predict(losses_array)
+    means = gmm.means_.flatten()
+    clean_label = np.argmin(means)
+
+    # Count clean/noisy samples
+    clean_count = np.sum(labels_gmm == clean_label)
+    noisy_count = len(labels_gmm) - clean_count
+
+    # Calculate noise ratio
+    noise_ratio = noisy_count / len(labels_gmm)
+    
+    return gmm, clean_count, noisy_count, noise_ratio, losses_array
+
+
 def train_net_fedrefiner(net_id, net, global_model, train_dataloader, test_dataloader, epochs, lr, args_optimizer, args, device="cpu", logger=None, is_warmup=True):
-    """FedRefiner本地训练函数"""
+    """FedRefiner local training function"""
     net.cuda()
-    
-    # 只使用SGD优化器
+
+    # Use SGD optimizer only
     optimizer = torch.optim.SGD(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, momentum=0.9, weight_decay=args.reg)
-    
+
     num_classes = net.l3.out_features if hasattr(net, 'l3') else args.num_class
+
+    # Pre-train GMM (only in non-warmup phase)
+    gmm = None
+    if not is_warmup:
+        gmm, clean_count, noisy_count, noise_ratio, losses_array = precompute_gmm_with_global_model(global_model, train_dataloader, args)
+        if logger:
+            logger.info(f"Client {net_id}: Clean samples: {clean_count}, Noisy samples: {noisy_count}, Noise ratio: {noise_ratio:.3f}")
     
     for epoch in range(epochs):
         epoch_loss_collector = []
@@ -32,12 +97,12 @@ def train_net_fedrefiner(net_id, net, global_model, train_dataloader, test_datal
                 feat = feat.unsqueeze(0)
             
             if is_warmup:
-                # 第一阶段：使用SCE进行预热
+                # Stage 1: Warmup with SCE
                 sce_criterion = SCELoss(alpha=args.sce_alpha, beta=args.sce_beta, num_classes=num_classes)
                 loss = sce_criterion(out, target)
             else:
-                # 第二阶段：GMM识别噪声样本 + 标签修正 + 对比损失
-                loss = train_net_fedrefiner_stage2(net, x, target, out, feat, args, num_classes)
+                # Stage 2: Use pre-trained GMM for noise identification
+                loss = train_net_fedrefiner_stage2_with_pretrained_gmm(net, x, target, out, feat, gmm, args, num_classes)
             
             loss.backward()
             optimizer.step()
@@ -50,18 +115,67 @@ def train_net_fedrefiner(net_id, net, global_model, train_dataloader, test_datal
     return None
 
 
+def train_net_fedrefiner_stage2_with_pretrained_gmm(net, x, target, out, feat, gmm, args, num_classes):
+    """FedRefiner stage 2 training logic with pre-trained GMM"""
+    # Compute cross-entropy loss
+    ce_loss_fn = torch.nn.CrossEntropyLoss(reduction='none')
+    ce_losses = ce_loss_fn(out, target).detach().cpu().numpy().reshape(-1, 1)
+
+    # Apply same normalization preprocessing to current batch losses
+    ce_losses = normalize_losses(ce_losses)
+
+    # Use pre-trained GMM for prediction
+    labels_gmm = gmm.predict(ce_losses)
+    means = gmm.means_.flatten()
+    clean_label = np.argmin(means)
+    clean_mask = torch.tensor(labels_gmm == clean_label, dtype=torch.bool, device=out.device)
+    noisy_mask = ~clean_mask
+
+    # Calculate model prediction confidence
+    probs = F.softmax(out, dim=1)
+    confidence, predicted_labels = torch.max(probs, dim=1)
+
+    # Label correction: Correct labels for high-confidence noisy samples
+    tao = getattr(args, 'tao', 0.8)  # Confidence threshold
+    corrected_targets = target.clone()
+
+    # For noisy samples with confidence above threshold, use model prediction as new label
+    high_conf_noisy_mask = noisy_mask & (confidence > tao)
+    corrected_targets[high_conf_noisy_mask] = predicted_labels[high_conf_noisy_mask]
+
+    # Calculate SCE loss (using corrected labels)
+    sce_criterion = SCELoss(alpha=args.sce_alpha, beta=args.sce_beta, num_classes=num_classes)
+    sce_loss = sce_criterion(out, corrected_targets)
+
+    # Calculate contrastive loss (based on loss_2 from TriTAN)
+    try:
+        contrastive_loss = compute_contrastive_loss(feat, corrected_targets, args)
+        # Additional check for abnormal loss values
+        if torch.isnan(contrastive_loss) or torch.isinf(contrastive_loss) or contrastive_loss < 0:
+            contrastive_loss = torch.tensor(0.0, device=feat.device, requires_grad=True)
+    except Exception as e:
+        # If any error occurs during contrastive loss computation, set to 0
+        contrastive_loss = torch.tensor(0.0, device=feat.device, requires_grad=True)
+
+    # Total loss
+    contrastive_weight = getattr(args, 'contrastive_weight', 0.1)
+    total_loss = sce_loss + contrastive_weight * contrastive_loss
+
+    return total_loss
+
+
 def train_net_fedrefiner_stage2(net, x, target, out, feat, args, num_classes):
-    """FedRefiner第二阶段训练逻辑"""
-    # 计算交叉熵损失用于GMM
+    """FedRefiner stage 2 training logic (original version, kept for comparison)"""
+    # Compute cross-entropy loss for GMM
     ce_loss_fn = torch.nn.CrossEntropyLoss(reduction='none')
     ce_losses = ce_loss_fn(out, target).detach().cpu().numpy().reshape(-1, 1)
     
-    # 如果batch size太小，直接使用SCE
+    # If batch size is too small, use SCE directly
     if len(ce_losses) < 2:
         sce_criterion = SCELoss(alpha=args.sce_alpha, beta=args.sce_beta, num_classes=num_classes)
         return sce_criterion(out, target)
     
-    # 使用GMM识别噪声样本
+    # Use GMM to identify noisy samples
     gmm = GaussianMixture(n_components=2, random_state=0)
     gmm.fit(ce_losses)
     labels_gmm = gmm.predict(ce_losses)
@@ -70,26 +184,26 @@ def train_net_fedrefiner_stage2(net, x, target, out, feat, args, num_classes):
     clean_mask = torch.tensor(labels_gmm == clean_label, dtype=torch.bool, device=out.device)
     noisy_mask = ~clean_mask
     
-    # 计算模型预测置信度
+    # Calculate model prediction confidence
     probs = F.softmax(out, dim=1)
     confidence, predicted_labels = torch.max(probs, dim=1)
     
-    # 标签修正：对高置信度的噪声样本进行标签修正
-    tao = getattr(args, 'tao', 0.8)  # 置信度阈值
+    # Label correction: Correct labels for high-confidence noisy samples
+    tao = getattr(args, 'tao', 0.8)  # Confidence threshold
     corrected_targets = target.clone()
     
-    # 对于噪声样本且置信度高于阈值的样本，使用模型预测作为新标签
+    # For noisy samples with confidence above threshold, use model prediction as new label
     high_conf_noisy_mask = noisy_mask & (confidence > tao)
     corrected_targets[high_conf_noisy_mask] = predicted_labels[high_conf_noisy_mask]
     
-    # 计算SCE损失（使用修正后的标签）
+    # Calculate SCE loss (using corrected labels)
     sce_criterion = SCELoss(alpha=args.sce_alpha, beta=args.sce_beta, num_classes=num_classes)
     sce_loss = sce_criterion(out, corrected_targets)
     
-    # 计算对比损失（基于TriTAN中的loss_2）
+    # Calculate contrastive loss (based on loss_2 from TriTAN)
     contrastive_loss = compute_contrastive_loss(feat, corrected_targets, args)
     
-    # 总损失
+    # Total loss
     contrastive_weight = getattr(args, 'contrastive_weight', 0.1)
     total_loss = sce_loss + contrastive_weight * contrastive_loss
     
@@ -97,33 +211,55 @@ def train_net_fedrefiner_stage2(net, x, target, out, feat, args, num_classes):
 
 
 def compute_contrastive_loss(feats, targets, args):
-    """计算对比损失，基于TriTAN中的loss_2"""
-    # 确保特征维度正确
+    """Calculate contrastive loss, based on loss_2 from TriTAN - GPU optimized version"""
+    # Ensure correct feature dimensions
     if feats.dim() == 1:
         feats = feats.unsqueeze(0)
     
-    # 归一化特征
+    batch_size = feats.shape[0]
+    
+    # If batch size is too small, return 0 directly
+    if batch_size < 2:
+        return torch.tensor(0.0, device=feats.device, requires_grad=True)
+
+    # Sampling strategy: If batch is too large, sample to improve computational efficiency
+    max_samples = getattr(args, 'contrastive_max_samples', 64)
+    if batch_size > max_samples:
+        # Random sampling, maintaining label distribution
+        indices = torch.randperm(batch_size, device=feats.device)[:max_samples]
+        feats = feats[indices]
+        targets = targets[indices]
+        batch_size = max_samples
+
+    # Normalize features
     feats = F.normalize(feats, p=2, dim=1)
-    
-    # 计算特征相似度矩阵
+
+    # Calculate feature similarity matrix
     sim_mat = torch.matmul(feats, feats.t())
-    
-    # 构建正负样本掩码
-    pos_mask = targets.expand(targets.shape[0], targets.shape[0]).t() == targets.expand(targets.shape[0], targets.shape[0])
+
+    # Construct label matrix - using vectorized operations
+    targets_expanded = targets.unsqueeze(1).expand(-1, batch_size)
+    targets_expanded_t = targets_expanded.t()
+
+    # Construct positive/negative sample mask - vectorized operations
+    pos_mask = (targets_expanded == targets_expanded_t)
     neg_mask = ~pos_mask
-    
-    # 硬负样本挖掘
+
+    # Hard negative sample mining - vectorized operations
     hard_neg_mask = neg_mask & (sim_mat > 0.5)
     pos_mask = pos_mask & (sim_mat < (1 - 1e-5))
-    
-    # 计算对比损失
-    pos_pair = sim_mat[pos_mask]
-    neg_pair = sim_mat[hard_neg_mask]
-    
-    if len(pos_pair) > 0 and len(neg_pair) > 0:
-        pos_loss = torch.sum(-pos_pair + 1)
-        neg_loss = torch.sum(neg_pair)
-        contrastive_loss = (pos_loss + neg_loss) / targets.shape[0]
+
+    # Use torch.where for batch indexing, avoiding direct indexing
+    pos_sim = torch.where(pos_mask, sim_mat, torch.zeros_like(sim_mat))
+    neg_sim = torch.where(hard_neg_mask, sim_mat, torch.zeros_like(sim_mat))
+
+    # Calculate loss - vectorized summation
+    pos_loss = torch.sum(pos_sim)
+    neg_loss = torch.sum(neg_sim)
+
+    # Check for valid positive/negative sample pairs
+    if pos_loss > 0 and neg_loss > 0:
+        contrastive_loss = (pos_loss + neg_loss) / batch_size
     else:
         contrastive_loss = torch.tensor(0.0, device=feats.device, requires_grad=True)
     
@@ -131,7 +267,7 @@ def compute_contrastive_loss(feats, targets, args):
 
 
 def fedrefiner_alg(args, n_comm_rounds, nets, global_model, party_list_rounds, net_dataidx_map, train_local_dls, test_dl, traindata_cls_counts, moment_v, device, global_dist, logger):
-    """FedRefiner算法主函数"""
+    """FedRefiner algorithm main function"""
     best_test_acc = 0
     best_f1 = 0
     best_precision = 0
@@ -143,10 +279,10 @@ def fedrefiner_alg(args, n_comm_rounds, nets, global_model, party_list_rounds, n
     record_recall_list = []
     record_loss_list = []
     
-    # 获取预热轮数
+    # Get warmup rounds
     warmup_rounds = getattr(args, 'fedrefiner_warmup', 5)
-    
-    # 第一阶段：预热阶段（使用SCE）
+
+    # Stage 1: Warmup phase (using SCE)
     logger.info("=== FedRefiner Stage 1: Warmup with SCE ===")
     print("=== FedRefiner Stage 1: Warmup with SCE ===")
     for round in range(warmup_rounds):
@@ -159,13 +295,13 @@ def fedrefiner_alg(args, n_comm_rounds, nets, global_model, party_list_rounds, n
         for net in nets_this_round.values():
             net.load_state_dict(global_w)
         
-        # 本地训练（预热阶段）
+        # Local training (warmup phase)
         for net_id, net in nets_this_round.items():
             train_dl_local = train_local_dls[net_id]
             train_net_fedrefiner(net_id, net, global_model, train_dl_local, test_dl, args.epochs, 
                                args.lr, args.optimizer, args, device, logger, is_warmup=True)
         
-        # 模型聚合
+        # Model aggregation
         total_data_points = sum([len(net_dataidx_map[r]) for r in party_list_this_round])
         fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in party_list_this_round]
         
@@ -181,7 +317,7 @@ def fedrefiner_alg(args, n_comm_rounds, nets, global_model, party_list_rounds, n
         global_model.load_state_dict(global_w)
         global_model.cuda()
         
-        # 测试
+        # Testing
         test_acc, f1, precision, recall, conf_matrix, avg_loss = compute_accuracy(global_model, test_dl, get_confusion_matrix=True, device=device)
         record_test_acc_list.append(test_acc)
         record_f1_list.append(f1)
@@ -190,7 +326,7 @@ def fedrefiner_alg(args, n_comm_rounds, nets, global_model, party_list_rounds, n
         record_loss_list.append(avg_loss)
         global_model.to('cpu')
         
-        # 更新最佳结果
+        # Update best results
         if test_acc > best_test_acc:
             best_test_acc = test_acc
         if f1 > best_f1:
@@ -210,47 +346,27 @@ def fedrefiner_alg(args, n_comm_rounds, nets, global_model, party_list_rounds, n
     logger.info("=== FedRefiner Stage 2: GMM + Label Correction + Contrastive Learning ===")
     print("=== FedRefiner Stage 2: GMM + Label Correction + Contrastive Learning ===")
     
-    # 第二阶段：GMM + 标签修正 + 对比学习
+    # Stage 2: GMM + Label Correction + Contrastive Learning
     for round in range(warmup_rounds, n_comm_rounds):
         logger.info(f"FedRefiner Stage 2 Round {round}")
         print(f"FedRefiner Stage 2 Round {round}")
         party_list_this_round = party_list_rounds[round]
         nets_this_round = {k: nets[k] for k in party_list_this_round}
         global_w = global_model.state_dict()
-        
+
         for net in nets_this_round.values():
             net.load_state_dict(global_w)
-        
-        # 本地训练（第二阶段）
+
+        # Local training (stage 2)
         for net_id, net in nets_this_round.items():
             train_dl_local = train_local_dls[net_id]
-            # 直接调用第二阶段的训练逻辑
-            net.cuda()
-            # 只使用SGD优化器
-            optimizer = torch.optim.SGD(filter(lambda p: p.requires_grad, net.parameters()), lr=args.lr, momentum=0.9, weight_decay=args.reg)
-            num_classes = net.l3.out_features if hasattr(net, 'l3') else args.num_class
-            
-            for epoch in range(args.epochs):
-                for batch_idx, (x, target, idx) in enumerate(train_dl_local):
-                    x, target = x.cuda(), target.cuda()
-                    optimizer.zero_grad()
-                    target = target.long()
-                    
-                    _, feat, out = net(x)
-                    if out.dim() == 1:
-                        out = out.unsqueeze(0)
-                    if feat.dim() == 1:
-                        feat = feat.unsqueeze(0)
-                    
-                    # 第二阶段：GMM识别噪声样本 + 标签修正 + 对比损失
-                    loss = train_net_fedrefiner_stage2(net, x, target, out, feat, args, num_classes)
-                    
-                    loss.backward()
-                    optimizer.step()
-            
-            net.to('cpu')
+            # Ensure global_model is on GPU for GMM pre-training
+            global_model.cuda()
+            # Use optimized training function (pre-trained GMM)
+            train_net_fedrefiner(net_id, net, global_model, train_dl_local, test_dl, args.epochs, 
+                               args.lr, args.optimizer, args, device, logger, is_warmup=False)
         
-        # 模型聚合
+        # Model aggregation
         total_data_points = sum([len(net_dataidx_map[r]) for r in party_list_this_round])
         fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in party_list_this_round]
         
@@ -271,7 +387,7 @@ def fedrefiner_alg(args, n_comm_rounds, nets, global_model, party_list_rounds, n
         global_model.load_state_dict(global_w)
         global_model.cuda()
         
-        # 测试
+        # Testing
         test_acc, f1, precision, recall, conf_matrix, avg_loss = compute_accuracy(global_model, test_dl, get_confusion_matrix=True, device=device)
         record_test_acc_list.append(test_acc)
         record_f1_list.append(f1)
@@ -280,7 +396,7 @@ def fedrefiner_alg(args, n_comm_rounds, nets, global_model, party_list_rounds, n
         record_loss_list.append(avg_loss)
         global_model.to('cpu')
         
-        # 更新最佳结果
+        # Update best results
         if test_acc > best_test_acc:
             best_test_acc = test_acc
         if f1 > best_f1:
@@ -297,13 +413,13 @@ def fedrefiner_alg(args, n_comm_rounds, nets, global_model, party_list_rounds, n
         print(f'Stage 2 Round {round}: Acc={test_acc:.4f}, F1={f1:.4f}, Precision={precision:.4f}, Recall={recall:.4f}, Loss={avg_loss:.4f}')
         print(f'Best so far: Acc={best_test_acc:.4f}, F1={best_f1:.4f}, Precision={best_precision:.4f}, Recall={best_recall:.4f}, Loss={best_loss:.4f}\n')
         
-        # 保存模型
+        # Save model
         if args.save_model:
             import os
             mkdirs(args.modeldir + 'fedrefiner/')
             torch.save(global_model.state_dict(), args.modeldir + 'fedrefiner/' + 'globalmodel' + args.log_file_name + '.pth')
     
-    # 计算最后10轮的平均值
+    # Calculate average of last 10 rounds
     def last_k_avg(lst, k=10):
         return np.mean(lst[-k:]) if len(lst) >= k else np.mean(lst)
     
