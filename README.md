@@ -1,1 +1,30 @@
-# Refiner
+# FedRefiner
+
+Official code for the paper "FedRefiner: Robust Federated Learning with Noisy Label Refinement for Remote Sensing".
+
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+## Example Usage
+
+```bash
+python FL_train.py --alg fedrefiner --model resnet18 --dataset RS-5 --noise_rate 0.8 --noise_pattern symmetric
+```
+More settings can be found in `args.py`.
+
+
+## Model Scalability
+
+![Model Scalability](./model_scale.png)
+
+
+## Remote Sensing Imagery
+![Remote Sensing Imagery](./raw_rs.png)
+
+
+## Citation
+
+TBD.

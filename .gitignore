@@ -114,3 +114,5 @@ checkpoints/*
 data/*
 nohup
 *.csv
+ablation.png
+TriTAN.py
