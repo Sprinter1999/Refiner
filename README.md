@@ -28,3 +28,6 @@ More settings can be found in `args.py`.
 ## Citation
 
 TBD.
+
+## Acknowledgments
+We sincerely appreciate the authors of the FedRS datasets, and more information can be found in the [FedRS](https://fedrs-bench.github.io/).
